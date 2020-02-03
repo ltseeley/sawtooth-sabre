@@ -14,12 +14,23 @@
 
 use protobuf::Message;
 use protobuf::RepeatedField;
+#[cfg(not(target_arch = "wasm32"))]
+use transact::{
+    protocol::transaction::{HashMethod, TransactionBuilder},
+    signing::Signer,
+};
 
 use std::error::Error as StdError;
 
 use crate::protos;
 use crate::protos::{
     FromBytes, FromNative, FromProto, IntoBytes, IntoNative, IntoProto, ProtoConversionError,
+};
+
+use super::{
+    compute_agent_address, compute_contract_address, compute_contract_registry_address,
+    compute_namespace_registry_address, compute_org_address, compute_smart_permission_address,
+    parse_hex, AddressingError, ADMINISTRATORS_SETTING_ADDRESS,
 };
 
 /// Native implementation for SabrePayload_Action
@@ -2149,13 +2160,19 @@ impl IntoNative<SabrePayload> for protos::payload::SabrePayload {}
 
 #[derive(Debug)]
 pub enum SabrePayloadBuildError {
+    AddressingError(String),
+    InvalidAction(String),
     MissingField(String),
+    ProtoConversionError(String),
 }
 
 impl StdError for SabrePayloadBuildError {
     fn description(&self) -> &str {
         match *self {
+            SabrePayloadBuildError::AddressingError(ref msg) => msg,
+            SabrePayloadBuildError::InvalidAction(ref msg) => msg,
             SabrePayloadBuildError::MissingField(ref msg) => msg,
+            SabrePayloadBuildError::ProtoConversionError(ref msg) => msg,
         }
     }
 }
@@ -2163,8 +2180,19 @@ impl StdError for SabrePayloadBuildError {
 impl std::fmt::Display for SabrePayloadBuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match *self {
+            SabrePayloadBuildError::AddressingError(ref s) => write!(f, "AddressingError: {}", s),
+            SabrePayloadBuildError::InvalidAction(ref s) => write!(f, "InvalidAction: {}", s),
             SabrePayloadBuildError::MissingField(ref s) => write!(f, "MissingField: {}", s),
+            SabrePayloadBuildError::ProtoConversionError(ref s) => {
+                write!(f, "ProtoConversionError: {}", s)
+            }
         }
+    }
+}
+
+impl From<AddressingError> for SabrePayloadBuildError {
+    fn from(err: AddressingError) -> Self {
+        Self::AddressingError(err.to_string())
     }
 }
 
@@ -2190,6 +2218,133 @@ impl SabrePayloadBuilder {
         })?;
 
         Ok(SabrePayload { action })
+    }
+
+    /// Convert the `SabrePayloadBuilder` into a `TransactionBuilder`, filling in all required
+    /// fields.
+    ///
+    /// NOTE: a signer is required because some input/output addresses of smart permission payloads
+    /// are calculated using the signer's public key.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn into_transaction_builder(
+        self,
+        signer: &dyn Signer,
+    ) -> Result<TransactionBuilder, SabrePayloadBuildError> {
+        let payload = self.build()?;
+
+        let (input_addresses, output_addresses) = match payload.action() {
+            Action::CreateContract(CreateContractAction { name, version, .. })
+            | Action::DeleteContract(DeleteContractAction { name, version, .. }) => {
+                let addresses = vec![
+                    compute_contract_registry_address(&name)?,
+                    compute_contract_address(&name, &version)?,
+                ];
+                (addresses.clone(), addresses)
+            }
+            Action::ExecuteContract(ExecuteContractAction {
+                name,
+                version,
+                inputs,
+                outputs,
+                ..
+            }) => {
+                let addresses = vec![
+                    compute_contract_registry_address(&name)?,
+                    compute_contract_address(&name, &version)?,
+                ];
+
+                let mut input_addresses = addresses.clone();
+                for input in inputs {
+                    let namespace = match input.get(..6) {
+                        Some(namespace) => namespace,
+                        None => {
+                            return Err(SabrePayloadBuildError::InvalidAction(format!(
+                                "invalid input: '{}' is less than 6 characters long",
+                                input,
+                            )));
+                        }
+                    };
+                    input_addresses.push(compute_namespace_registry_address(namespace)?);
+                    input_addresses.push(parse_hex(&input)?);
+                }
+
+                let mut output_addresses = addresses;
+                for output in outputs {
+                    let namespace = match output.get(..6) {
+                        Some(namespace) => namespace,
+                        None => {
+                            return Err(SabrePayloadBuildError::InvalidAction(format!(
+                                "invalid output: '{}' is less than 6 characters long",
+                                output,
+                            )));
+                        }
+                    };
+                    output_addresses.push(compute_namespace_registry_address(namespace)?);
+                    output_addresses.push(parse_hex(&output)?);
+                }
+
+                (input_addresses, output_addresses)
+            }
+            Action::CreateContractRegistry(CreateContractRegistryAction { name, .. })
+            | Action::DeleteContractRegistry(DeleteContractRegistryAction { name, .. })
+            | Action::UpdateContractRegistryOwners(UpdateContractRegistryOwnersAction {
+                name,
+                ..
+            }) => {
+                let addresses = vec![
+                    compute_contract_registry_address(&name)?,
+                    ADMINISTRATORS_SETTING_ADDRESS.into(),
+                ];
+                (addresses.clone(), addresses)
+            }
+            Action::CreateNamespaceRegistry(CreateNamespaceRegistryAction {
+                namespace, ..
+            })
+            | Action::DeleteNamespaceRegistry(DeleteNamespaceRegistryAction {
+                namespace, ..
+            })
+            | Action::UpdateNamespaceRegistryOwners(UpdateNamespaceRegistryOwnersAction {
+                namespace,
+                ..
+            })
+            | Action::CreateNamespaceRegistryPermission(
+                CreateNamespaceRegistryPermissionAction { namespace, .. },
+            )
+            | Action::DeleteNamespaceRegistryPermission(
+                DeleteNamespaceRegistryPermissionAction { namespace, .. },
+            ) => {
+                let addresses = vec![
+                    compute_namespace_registry_address(&namespace)?,
+                    ADMINISTRATORS_SETTING_ADDRESS.into(),
+                ];
+                (addresses.clone(), addresses)
+            }
+            Action::CreateSmartPermission(CreateSmartPermissionAction { org_id, name, .. })
+            | Action::UpdateSmartPermission(UpdateSmartPermissionAction { org_id, name, .. })
+            | Action::DeleteSmartPermission(DeleteSmartPermissionAction { org_id, name, .. }) => {
+                let addresses = vec![
+                    compute_smart_permission_address(&org_id, &name)?,
+                    compute_agent_address(signer.public_key())?,
+                    compute_org_address(&org_id)?,
+                ];
+                (addresses.clone(), addresses)
+            }
+        };
+
+        let payload_bytes = payload.into_bytes().map_err(|err| {
+            SabrePayloadBuildError::ProtoConversionError(format!(
+                "failed to serialize SabrePayload as bytes: {}",
+                err
+            ))
+        })?;
+
+        Ok(TransactionBuilder::new()
+            .with_family_name("sabre".into())
+            .with_family_version(env!("CARGO_PKG_VERSION").into())
+            .with_inputs(input_addresses)
+            .with_outputs(output_addresses)
+            .with_payload_hash_method(HashMethod::SHA512)
+            .with_payload(payload_bytes))
     }
 }
 
