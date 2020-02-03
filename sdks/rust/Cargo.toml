@@ -28,6 +28,9 @@ edition = "2018"
 [dependencies]
 protobuf = "2"
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+transact = "0.2"
+
 [build-dependencies]
 protoc-rust = "2"
 glob = "0.2"
